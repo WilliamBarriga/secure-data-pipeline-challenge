@@ -1,4 +1,4 @@
-# cauce
+# Secure Data Pipeline Challenge (`cauce`)
 
 ## Summary (English)
 
