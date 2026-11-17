@@ -1,0 +1,26 @@
+// Tema neutro de cauce sobre neutral-dark: misma forma de tarjetas, grupos y aristas; varia la Paleta
+// (grises y azules sobrios), la fuente Inter y un fondo liso gris azulado con vineta suave.
+theme cauce extends neutral-dark {
+  palette {
+    gray "#9ca3af"  blue "#5b8def"  green "#4fae9a"  amber "#d4a24c"  red "#d96a6a"  purple "#8a94b8"  cyan "#5fa8c4"
+    fondo "#0f1318"  papel "#171c23"  tinta "#e5e7eb"  marco "#7b8494"  linea "#8b93a1"  sombra "#000000"
+    pizarra "#161b22"  azulgris "#0f1318"
+  }
+  fonts { body "Inter"  mono "JetBrains Mono"  fallback "sans-serif" }
+  tokens { background "#0f1318"  foreground "#e5e7eb"  border "#7b8494" }
+  page {
+    layer puntos lines { color tinta/0.03  size 3  angle 0 }
+    layer cielo gradient before puntos { from pizarra  to azulgris  angle 135 }
+    layer vineta radial after puntos { from fondo/0  to fondo/0.5  x 50  y 50 }
+  }
+  node {
+    layer tinte gradient after relleno { from COLOR/0.08  to COLOR/0  angle 180 }
+    state hover { layer borde { color COLOR }  layer glow glow before forma { color COLOR/0.25  radius 10 } }
+  }
+  group { layer borde { color gray/0.45 } }
+  edge {
+    layer linea { color blue }
+    start dot { color blue }
+    end chevron { color blue }
+  }
+}

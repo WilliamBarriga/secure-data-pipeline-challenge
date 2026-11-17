@@ -1,0 +1,258 @@
+// Arquitectura y flujo de la plataforma de datos cauce.
+// Deep modules: nucleo puro (sin I/O) + bordes con I/O; un solo puerto real (FuenteEventos: Kafka | memoria).
+// Postgres sin puerto: `almacen` es profundo y se prueba contra PG real (B3/B5 viven en SQL).
+// Revision pre-build: custodia es la unica puerta tipada a almacen; conteos nacen en fuentes;
+// runtime docker|local con el mismo contrato de rutas; el catalogo de fuentes es la unica verdad de headers.
+// Review de arquitectura: la Ficha de Fuente (fuentes.FICHAS) declara campos, lectura, destino, carga y origen de cada
+// fuente; los demas modulos la consultan en vez de ramificar por nombre. Las Fotos de out/ salen de bordes/fotos.
+// Cada grupo de `compose.app` es una carpeta de src/cauce/ (aplicacion/, nucleo/, bordes/, arranque/); cli.py, entorno.py y config.py
+// viven en la raiz del paquete. tests/unit/test_capas.py hace cumplir las dependencias entre carpetas.
+// Review de arquitectura: `corrida.ejecutar` es el ciclo de vida comun (lock, clasificacion fail-fast,
+// Bitacora inicio/fin, metrics.json, exit code) y batch y stream solo aportan su cuerpo; `entorno` resuelve rutas y
+// Kafka una vez y la cli las inyecta; `bitacora.registrar_etapas_fin` es el etapa_fin de los dos cuerpos.
+// Threat model: la Vista `amenazas` recorre los 5 Limites de confianza de THREAT_MODEL.md; las Aristas
+// etiquetadas T1..T12 ubican cada amenaza en el flujo.
+// Revision de alineacion con el codigo (final): `config` (estado/.env -> Config) y `arranque.credenciales_yaml` /
+// `arranque.secretos` entran al mapa; `correr_batch` y `correr_stream` reciben la ruta de la clasificacion; el servicio
+// compose `credenciales` es el unico con credenciales.yaml rw (la app lo monta ro); `cli` tambien orquesta `producir`,
+// `clasificacion` y `auditar-salidas`. La infra de AWS (no se despliega) vive en infra-terraform.dg.
+
+specification {
+  node actor     { description "Quien dispara el contrato" icon user color purple }
+  node grupo     { description "Agrupacion (proceso, contenedor, capa)" icon box color gray }
+  node modulo    { description "Modulo Python (interfaz chica)" icon server color blue }
+  node puerto    { description "Seam con dos adapters reales" icon box color amber }
+  node adapter   { description "Adapter de un puerto" icon server color amber }
+  node archivo   { description "Archivo o carpeta en disco" icon box color gray }
+  node motor     { description "Servicio de infraestructura" icon database color green }
+  node cola      { description "Broker de mensajes" icon queue color amber }
+  node externo   { description "Script provisto por el brief (no se toca)" icon cloud color red }
+  node servicio  { description "Servicio de compose de un solo uso (profile app)" icon box color purple }
+}
+
+model {
+  actor operador "Operador del host" "make setup/up/run/stream/test/down/credenciales/auditar-salidas; ve estado/.env (KEK, K_bidx), credenciales.yaml y los volumenes (Limite 5)"
+
+  grupo disco "Disco del host" {
+    archivo data "data/" "Inmutable, montado solo lectura"
+    archivo cred_yaml "credenciales.yaml" "Fuente unica de credenciales efimeras"
+    archivo env "estado/.env" "0600, gitignored; generado por make up (+ KEK y K_bidx); carpeta rw para ambos runtimes"
+    archivo clasif "data_classification.yaml" "Artefacto vivo (C1)"
+    archivo out "out/" "consumo_mensual.csv, dq_report.json, metrics.json, alertas.json; make crea out/ logs/ estado/ antes de $(CAUCE)"
+    archivo logs "logs/pipeline.log" "JSON, una linea por evento, sin PII"
+  }
+
+  grupo compose "docker compose" "Puertos solo en 127.0.0.1; imagenes por version+digest; healthchecks" {
+    motor postgres "Postgres 16" "Esquemas raw/quarantine/crypto/core/analytics/audit; scram-sha-256, pg_hba propio"
+    cola redpanda "Redpanda" "Topico mediciones.raw; auto-create apagado"
+
+    grupo app "Proceso cauce" "Contenedor python:3.13-slim (defecto, read_only, cap_drop ALL, --user uid:gid) o .venv del host (RUNTIME=local); mismo contrato: data/ ro; out/ logs/ estado/ rw; credenciales.yaml ro (rw solo el servicio credenciales); tools/ en la imagen, tests/ montados ro" {
+      grupo aplicacion "Aplicacion" "src/cauce/aplicacion/ (+ cli.py en la raiz). Orquestadores delgados: cablean adapters" {
+        modulo cli "python -m cauce" "preparar | bootstrap | credenciales | clasificacion | run | producir | stream | auditar-salidas; arma el Entorno una vez e inyecta rutas y Kafka; abre Observabilidad e instala el excepthook; excepcion con codigo_error -> exit 2"
+        modulo entorno "entorno.resolver(environ) -> Entorno" "src/cauce/entorno.py (raiz del paquete). Puro: rutas (data, out, log, clasificacion, credenciales, .env) y Kafka (bootstrap, topico) desde un mapping; unico lugar con CAUCE_* y KAFKA_* (test_capas)"
+        modulo config "config.cargar(estado/.env) -> Config" "src/cauce/config.py (raiz del paquete). Modelo pydantic strict+frozen de host, puerto, base, 4 usuarios y las llaves KEK y K_bidx; el entorno gana sobre el .env; sin defaults de secretos; no depende de ninguna capa (test_capas)"
+        modulo corrida "corrida.ejecutar(cfg, obs, id, comando, cuerpo, ruta_clasificacion=, escribir=)" "Ciclo de vida comun de toda Corrida: abrir_corrida (conectar, corrida_inicio, lock, rollback uniforme, corrida_fin con codigo_error, metrics.json con escritor inyectable), clasificacion fail-fast (C1) por verificar_esquema, cuerpo(c, clasif) y exit code; CorridaNoIniciada = lock tomado, exit 1. verificar_clasificacion(cfg, ruta) es el check suelto de make test"
+        modulo corrida_batch "corrida_batch.correr_batch(cfg, obs, id, ruta_clasificacion, dir_datos=)" "Cuerpo de make run: Custodio con KEK y K_bidx, abrir_dek; ETAPAS por nombre de fuente (fronteras, clientes, consumos, facturacion) y una etapa salidas; descubre en data/ segun el Origen de cada Ficha, itera archivos, loguea cada Desenlace (y frontera_fuera_maestro desde sus conteos) y suma para etapa_fin"
+        modulo ingesta_archivo "ingesta_archivo.ingerir(ctx, fuente, nombre, ruta) -> Desenlace" "Un archivo, un Desenlace (cargado | omitido | rechazado): sha256, estado (Omitido, Modificado), leer, custodiar, cargar, evento en la Bitacora y commit"
+        modulo corrida_stream "corrida_stream.correr_stream(cfg, obs, id, fuente, ruta_clasificacion, dir_datos=)" "Cuerpo de make stream sobre corrida.ejecutar (la clasificacion fail-fast incluye el esquema de mediciones.raw); universo y Banda operativa desde data/maestros; Detector; alertas.json ordenado; metrics.json solo reemplaza stream; etapa_fin por totales, motivo de descarte y tipo de Alerta; log, metrics y Bitacora salen de Alertas.resumen()"
+      }
+
+      grupo nucleo "Nucleo puro" "src/cauce/nucleo/. Sin I/O ni imports fuera de nucleo (test_capas); se prueba directo por la interfaz; modelos pydantic strict+frozen+hide_input_in_errors" {
+        modulo fuentes "fuentes.leer(fuente, nombre, bytes) / FICHAS / ficha_por_lotes" "Ficha de Fuente por fuente: campos, formato, codificaciones, perfiles, Destino(raw, core, clave, con_corrida), carga maestro|consumo|factura, Origen(subdir, nombres|extension), rechaza_modificado; CATALOGO derivado = unica verdad de headers; parseo puro B1 B2 B4 B7 con Decimal -> registros + rechazos + conteos; MotivoRechazoArchivo trae codigo_error y motivo_desenlace"
+        modulo pii "pii.enmascarar(texto) / detectar_estricto" "C2: tokens [EMAIL]/[CELULAR]/[CEDULA]"
+        modulo custodia "custodia.custodiar(resultado, clasificacion, custodio, fuente=)" "Unica puerta a almacen: enmascara (C2), cifra AES-256-GCM + bidx (C3) y descarta segun el nivel -> ResultadoCustodiado (tabular csv | factura json); Custodio con llaves inyectadas; nueva_dek envuelve la DEK con la KEK"
+        modulo clasificacion "clasificacion.Clasificacion" "C1: politica(campo) + verificar(catalogo, columnas) fail-fast; declara ZONAS; nunca lee data/"
+        modulo alertas "alertas.Detector" "procesar(evento) / cerrar() -> Alertas (resumen, validos, invalidos): maquina de estados del stream"
+      }
+
+      grupo bordes "Bordes con I/O" "src/cauce/bordes/. No importan aplicacion ni arranque (test_capas)" {
+        modulo almacen "almacen" "registrar / cargar(ResultadoCustodiado, corrida): linaje comun + cargador(carga) de la Ficha (maestro = upsert SCD1, consumo = raw.lectura_consumo + merge B3, factura = huerfanas y duplicadas en SQL); sin defecto silencioso; columnas desde la fila custodiada; COLLATE C; conteos por archivo (fronteras_fuera_maestro); ORDEN_B3 publico"
+        modulo fotos "fotos.materializar_salidas(con), fotos.metricas_acumuladas(con)" "Fotos de out/: dq_report.json y consumo_mensual.csv calculadas enteras desde la base, y los conteos de primer nivel de metrics.json (archivos vigentes); solo lee; comparte almacen.ORDEN_B3 y los nombres de contadores del nucleo (fuentes.CONTADORES_B, custodia.CLIENTES_CON_PII)"
+        modulo bitacora "bitacora.registrar_evento / registrar_etapas_fin" "Llama audit.registrar_evento (SECURITY DEFINER + advisory xact lock para la cadena de hash)"
+        modulo observabilidad "observabilidad" "Logger JSON con filtro de PII por clave + metrics.json (Metricas.con_conteos_de_base: conteos de la base arriba, los de la Corrida en `corrida`); STREAM_VACIO declara una sola vez el bloque stream"
+        modulo salidas "salidas" "Escritura atomica a out/ (tmp + rename) con detectar_estricto; auditar(out/, logs/) para make auditar-salidas"
+        puerto fuente_eventos "FuenteEventos" "Puerto del stream: eventos() crudos + corte (None | inactividad | tope)"
+        adapter kafka "Adapter Kafka" "FuenteKafka: kafka-python, assign sin group ni commits desde earliest hasta el high watermark de Kafka tomado al empezar; inactividad 10 s y tope 210 s con la conexion incluida (Corte del puerto -> Corrida parcial); producer cortado a 30 s; asegurar_topico para make stream"
+        adapter memoria "Adapter en memoria" "Lista de eventos para tests"
+      }
+
+      grupo arranque "Arranque" "src/cauce/arranque/: make up y make credenciales; corre antes de cualquier Corrida" {
+        modulo preparar "preparar(credenciales, env)" "credenciales.yaml -> estado/.env 0600 (tmp + rename); valida passwords con secretos; genera KEK y K_bidx solo si faltan"
+        modulo credenciales_yaml "credenciales_yaml.cargar / rellenar_credenciales" "credenciales.yaml con yaml.safe_load en un modelo pydantic (extra ignore); rellenar_credenciales reemplaza los password TODO (o todos con --rotar) preservando comentarios"
+        modulo secretos "secretos.validar_password / generar_password" "Rechaza placeholder y menos de 24 caracteres (mensaje con la clave, nunca el valor); genera passwords aleatorios"
+        modulo bootstrap "bootstrap(cfg, database=, recrear=)" "Roles cauce_owner + 3 de login, DDL de sql/*.sql en una tx como cauce_owner, huella sha256 en audit.ddl_huella (misma huella salta; distinta falla), endurecimiento por rol y primera DEK; --recrear solo para cauce_test"
+      }
+    }
+  }
+
+  servicio credenciales "Servicio credenciales" "Misma imagen que app; unico con credenciales.yaml rw (y estado/); python -m cauce credenciales [--rotar]"
+
+  externo producer "tools/producer.py" "Alimenta mediciones.raw; corre via $(CAUCE) producir contra redpanda:29092"
+
+  // Contrato
+  operador -> compose.app.aplicacion.cli "make run / make stream"
+  operador -> credenciales "make credenciales"
+  credenciales -> disco.cred_yaml "rellena password TODO, en sitio"
+  compose.app.aplicacion.cli -> compose.app.aplicacion.config "config.cargar(e.env) salvo preparar, credenciales y auditar-salidas"
+  disco.cred_yaml -> disco.env "make up lo renderiza"
+  compose.app.aplicacion.cli -> compose.app.arranque.preparar "preparar / credenciales"
+  compose.app.aplicacion.cli -> compose.app.arranque.bootstrap "bootstrap"
+  disco.cred_yaml -> compose.app.arranque.credenciales_yaml "safe_load"
+  compose.app.arranque.preparar -> compose.app.arranque.credenciales_yaml "cargar"
+  compose.app.arranque.preparar -> compose.app.arranque.secretos "validar_password"
+  compose.app.arranque.credenciales_yaml -> compose.app.arranque.secretos "generar_password"
+  compose.app.aplicacion.cli -> compose.app.arranque.credenciales_yaml "credenciales: rellenar_credenciales"
+  compose.app.arranque.preparar -> disco.env "escribe 0600"
+  compose.app.arranque.bootstrap -> compose.postgres "superusuario: roles + DDL + crypto.dek"
+  compose.app.arranque.bootstrap -> compose.app.nucleo.custodia "nueva_dek(kek)"
+  compose.app.arranque.bootstrap -> compose.app.bordes.almacen "conectar como superusuario"
+  disco.env -> compose.postgres "credenciales de roles y superusuario"
+  disco.env -> compose.app.aplicacion.config "config por env, validada con pydantic"
+
+  // Batch
+  compose.app.aplicacion.cli -> compose.app.aplicacion.entorno "resolver(os.environ)"
+  compose.app.aplicacion.cli -> compose.app.aplicacion.corrida_batch "run"
+  compose.app.aplicacion.corrida_batch -> compose.app.aplicacion.corrida "ejecutar(cuerpo)"
+  compose.app.aplicacion.corrida -> compose.app.nucleo.clasificacion "verificar al arrancar"
+  compose.app.aplicacion.corrida -> compose.app.bordes.almacen "conectar, lock_corrida, columnas_modelo"
+  compose.app.aplicacion.cli -> compose.app.aplicacion.corrida "clasificacion: verificar_clasificacion (make test)"
+  compose.app.aplicacion.cli -> compose.app.bordes.observabilidad "Observabilidad.abrir, excepthook"
+  compose.app.aplicacion.cli -> compose.app.bordes.salidas "auditar-salidas: out/ y logs/ sin base"
+  compose.app.aplicacion.corrida -> compose.app.bordes.bitacora "corrida_inicio / corrida_fin"
+  compose.app.aplicacion.corrida -> compose.app.bordes.salidas "metrics.json"
+  disco.clasif -> compose.app.nucleo.clasificacion "se carga"
+  disco.data -> compose.app.aplicacion.corrida_batch "bytes de cada archivo descubierto"
+  compose.app.aplicacion.corrida_batch -> compose.app.aplicacion.ingesta_archivo "ingerir(archivo) -> Desenlace"
+  compose.app.aplicacion.corrida_batch -> compose.app.nucleo.fuentes "FICHAS: Origen en data/"
+  compose.app.aplicacion.ingesta_archivo -> compose.app.nucleo.fuentes "leer / rechaza_modificado"
+  compose.app.aplicacion.ingesta_archivo -> compose.app.nucleo.custodia "custodiar(resultado)"
+  compose.app.nucleo.custodia -> compose.app.nucleo.pii "observaciones"
+  compose.app.nucleo.custodia -> compose.app.nucleo.fuentes "Resultado, ficha_por_lotes, MotivoRechazoArchivo"
+  compose.app.aplicacion.corrida_batch -> compose.app.nucleo.custodia "Custodio(kek, k_bidx)"
+  compose.app.nucleo.custodia -> compose.app.nucleo.clasificacion "nivel por campo"
+  compose.app.aplicacion.ingesta_archivo -> compose.app.bordes.almacen "registrar / cargar(ResultadoCustodiado)"
+  compose.app.bordes.almacen -> compose.app.nucleo.fuentes "Ficha: destino y carga"
+  compose.app.bordes.almacen -> compose.app.nucleo.custodia "solo acepta ResultadoCustodiado"
+  compose.app.bordes.almacen -> compose.app.nucleo.clasificacion "ZONAS"
+  compose.app.aplicacion.corrida_batch -> compose.app.bordes.fotos "materializar_salidas, metricas_acumuladas"
+  compose.app.bordes.fotos -> compose.app.bordes.almacen "ORDEN_B3"
+  compose.app.bordes.fotos -> compose.app.nucleo.fuentes "CONTADORES_B"
+  compose.app.bordes.fotos -> compose.app.nucleo.custodia "CLIENTES_CON_PII"
+  compose.app.bordes.fotos -> compose.postgres "lee (rol ingesta)"
+  compose.app.bordes.almacen -> compose.postgres "rol ingesta"
+  compose.app.aplicacion.corrida_batch -> compose.app.bordes.salidas "Fotos: consumo_mensual, dq_report"
+  compose.app.bordes.salidas -> disco.out "atomico"
+  compose.app.aplicacion.corrida_batch -> compose.app.bordes.bitacora "etapa_fin por fuente"
+  compose.app.aplicacion.ingesta_archivo -> compose.app.bordes.bitacora "archivo_cargado / archivo_omitido / archivo_rechazado"
+  compose.app.bordes.bitacora -> compose.postgres "audit.registrar_evento"
+  compose.app.aplicacion.corrida_batch -> compose.app.bordes.observabilidad "eventos y metricas"
+  compose.app.bordes.observabilidad -> compose.app.nucleo.pii "ultimo recurso: detectar_estricto sobre la linea"
+  compose.app.bordes.observabilidad -> disco.logs "JSON sin PII"
+  compose.app.bordes.observabilidad -> disco.out "metrics.json"
+
+  // Stream
+  producer -> compose.redpanda "3.795 eventos"
+  compose.app.aplicacion.cli -> producer "producir: subprocess --rate 0, cortado a 30 s (ORIGEN_STREAM)"
+  compose.app.aplicacion.cli -> compose.app.bordes.fuente_eventos "producir: asegurar_topico; stream: FuenteKafka"
+  compose.app.aplicacion.cli -> compose.app.aplicacion.corrida_stream "stream"
+  compose.app.aplicacion.corrida_stream -> compose.app.aplicacion.corrida "ejecutar(cuerpo)"
+  compose.app.aplicacion.corrida_stream -> compose.app.nucleo.fuentes "maestros por Origen"
+  compose.app.aplicacion.corrida_stream -> compose.app.bordes.fuente_eventos "eventos hasta high watermark"
+  compose.app.bordes.kafka -> compose.app.bordes.fuente_eventos "implementa"
+  compose.app.bordes.memoria -> compose.app.bordes.fuente_eventos "implementa (tests)"
+  compose.app.bordes.kafka -> compose.redpanda "assign, sin consumer group"
+  compose.app.aplicacion.corrida_stream -> compose.app.nucleo.alertas "procesar / cerrar"
+  compose.app.nucleo.alertas -> compose.app.nucleo.fuentes "CATALOGO[stream]: esquema de mediciones.raw"
+  compose.app.aplicacion.corrida_stream -> compose.app.bordes.salidas "alertas.json"
+  compose.app.aplicacion.corrida_stream -> compose.app.bordes.bitacora "etapa_fin del cierre"
+
+  // Amenazas (THREAT_MODEL.md): quien queda del otro lado de cada Limite de confianza
+  actor intruso "Proceso local hostil" "Cualquier proceso en 127.0.0.1 sin credenciales (Limite 2)"
+  actor analista "Rol analista" "Solo analytics.v_consumo_mensual, definer + security_barrier (Limite 4)"
+  actor auditor "Rol auditor" "Solo la Bitacora y audit.verificar_cadena (Limite 4)"
+  intruso -> compose.redpanda "T1 eventos falsos / T12 inundacion (sin SASL)"
+  disco.data -> compose.app "T2 archivo hostil / T3 archivo modificado / T12 archivo gigante"
+  compose.app -> disco.logs "T6 PII en logs"
+  analista -> compose.postgres "T7 PII por tablas base, TEMP, lo_*"
+  auditor -> compose.postgres "T5 lee la Bitacora"
+  operador -> disco.env "T8 T9 llaves en env (riesgo aceptado)"
+  operador -> compose.postgres "T4 superusuario edita la Bitacora"
+  operador -> disco.cred_yaml "T10 credenciales en claro / secreto heredado"
+  operador -> compose.app "T11 dependencia o imagen manipulada"
+}
+
+view arquitectura {
+  type architecture
+  theme cauce
+  include operador, disco.**, compose.**, credenciales, producer
+}
+
+view flujo-run {
+  type flow
+  theme cauce
+  include operador, credenciales, disco.**, compose.postgres, compose.app.**
+  steps {
+    step "make credenciales y make up: credenciales.yaml -> .env -> Postgres con roles" {
+      show operador, credenciales, disco.cred_yaml, disco.env, compose.postgres, compose.app.arranque.**
+    }
+    step "make run arranca y verifica la clasificacion (fail-fast)" {
+      show compose.app.aplicacion.cli, compose.app.aplicacion.entorno, compose.app.aplicacion.config, compose.app.aplicacion.corrida, compose.app.aplicacion.corrida_batch, compose.app.nucleo.clasificacion, disco.clasif
+    }
+    step "Descubre data/ y ingesta_archivo decide el Desenlace de cada archivo; pasa por fuentes.leer (B1 B2 B4 B7 + conteos)" {
+      show disco.data, compose.app.aplicacion.ingesta_archivo, compose.app.nucleo.fuentes
+    }
+    step "custodia: enmascara, cifra y descarta antes de tocar la base (C2, C3)" {
+      show compose.app.nucleo.custodia, compose.app.nucleo.pii
+    }
+    step "almacen carga raw/quarantine/core con el cargador de la Ficha y resuelve B3/B5 en SQL" {
+      show compose.app.bordes.almacen
+    }
+    step "Fotos desde la base, salidas atomicas, bitacora append-only y logs sin PII" {
+      show compose.app.bordes.fotos, compose.app.bordes.salidas, compose.app.bordes.bitacora, compose.app.bordes.observabilidad, disco.out, disco.logs
+    }
+  }
+}
+
+view flujo-stream {
+  type flow
+  theme cauce
+  include operador, producer, compose.redpanda, compose.postgres, compose.app.aplicacion.**, compose.app.nucleo.alertas, compose.app.bordes.**, disco.out
+  exclude compose.app.aplicacion.corrida_batch, compose.app.aplicacion.ingesta_archivo, compose.app.bordes.almacen, compose.app.bordes.fotos, compose.app.bordes.observabilidad
+  steps {
+    step "make stream: asegura topico y corre producer hasta terminar" {
+      show operador, producer, compose.redpanda
+    }
+    step "Consumidor por el puerto FuenteEventos (adapter Kafka, assign hasta high watermark)" {
+      show compose.app.aplicacion.cli, compose.app.aplicacion.entorno, compose.app.aplicacion.config, compose.app.aplicacion.corrida, compose.app.aplicacion.corrida_stream, compose.app.bordes.fuente_eventos, compose.app.bordes.kafka, compose.app.bordes.memoria
+    }
+    step "Detector puro emite alertas y cierra rachas al final" {
+      show compose.app.nucleo.alertas
+    }
+    step "alertas.json atomico y corrida en la bitacora" {
+      show compose.app.bordes.salidas, compose.app.bordes.bitacora, compose.postgres, disco.out
+    }
+  }
+}
+
+view amenazas {
+  type flow
+  theme cauce
+  include intruso, analista, auditor, operador, producer, disco.**, compose.postgres, compose.redpanda, compose.app
+  steps {
+    step "Limite 1 disco del host <-> app: data/ es hostil (T2, T3, T12); out/ y logs/ sin PII (T6)" {
+      show operador, disco.data, disco.out, disco.logs, compose.app
+    }
+    step "Limite 2 localhost y producer -> Redpanda -> consumidor, sin auth (T1, T12)" {
+      show intruso, producer, compose.redpanda
+    }
+    step "Limite 3 app -> Postgres como ingesta: Bitacora por SECURITY DEFINER, solo ciphertext (T5, T8, T9)" {
+      show compose.postgres
+    }
+    step "Limite 4 consumidores de Postgres: analista y auditor (T4, T7)" {
+      show analista, auditor
+    }
+    step "Limite 5 operador del host: estado/.env, credenciales.yaml, KEK, volumenes, imagenes (T4, T8, T9, T10, T11)" {
+      show operador, disco.env, disco.cred_yaml, disco.clasif
+    }
+  }
+}

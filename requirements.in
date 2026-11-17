@@ -1,0 +1,8 @@
+# Dependencias directas (ADR 0002). requirements.txt las fija con sus transitivas y los hashes
+# de PyPI (ver cabecera de requirements.txt); se instala con --require-hashes.
+# Solo runtime: las herramientas de prueba y lint van en requirements-dev.in.
+psycopg2-binary==2.9.13
+kafka-python==3.0.13
+cryptography
+PyYAML==6.0.3
+pydantic

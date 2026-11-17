@@ -1,0 +1,345 @@
+# Clasificacion de datos: artefacto vivo (C1). El pipeline lo carga al arrancar `make run`
+# (y `make test`) y aborta con codigo_error=clasificacion_incompleta si algo quedo sin clasificar.
+#
+# La unidad es el campo logico de la fuente (<fuente>.<campo>), no la columna fisica. La politica sale
+# del nivel (src/cauce/clasificacion.py):
+#   Restringido-PII  cifrar antes de la 1ra escritura; no analytics; valor no va a logs/out
+#   Confidencial     en claro en PG; no analytics; valor no va a logs/out
+#   Interno          sin restriccion
+#   Publico          idem Interno; marca lo publicable fuera de Cauce
+# Overrides: bidx, tratamiento: enmascarar_texto_libre, descartar: [raw, core].
+# Un header de fuente esta clasificado si existe <fuente>.<header> o si un campo de la fuente lo declara
+# en `aliases`. El catalogo de headers vive solo en src/cauce/nucleo/fuentes.py.
+# Cada columna fisica de las 6 zonas debe aparecer exactamente una vez, en `fisicas` o en `tecnicas`.
+version: 1
+
+campos:
+  # ---- cliente (maestros/clientes.csv) --------------------------------------------------------
+  cliente.cliente_id:
+    nivel: Interno
+    fisicas: [raw.cliente.cliente_id, core.dim_cliente.cliente_id, core.dim_frontera.cliente_id,
+              core.fact_factura.cliente_id, analytics.v_consumo_mensual.cliente_id]
+  cliente.razon_social:
+    nivel: Confidencial          # el detector puede fallar
+    fisicas: [raw.cliente.razon_social, core.dim_cliente.razon_social]
+  cliente.nit:
+    nivel: Restringido-PII
+    bidx: true
+    fisicas: [raw.cliente.nit_cifrado, core.dim_cliente.nit_cifrado, core.dim_cliente.nit_bidx]
+  cliente.email_contacto:
+    nivel: Restringido-PII
+    fisicas: [raw.cliente.email_contacto_cifrado, core.dim_cliente.email_contacto_cifrado]
+  cliente.celular_contacto:
+    nivel: Restringido-PII
+    fisicas: [raw.cliente.celular_contacto_cifrado, core.dim_cliente.celular_contacto_cifrado]
+  cliente.direccion:
+    nivel: Restringido-PII
+    fisicas: [raw.cliente.direccion_cifrado, core.dim_cliente.direccion_cifrado]
+  cliente.ciudad:
+    nivel: Interno
+    fisicas: [raw.cliente.ciudad, core.dim_cliente.ciudad]
+  cliente.departamento:
+    nivel: Interno
+    fisicas: [raw.cliente.departamento, core.dim_cliente.departamento]
+  cliente.representante_legal:
+    nivel: Restringido-PII
+    fisicas: [raw.cliente.representante_legal_cifrado, core.dim_cliente.representante_legal_cifrado]
+  cliente.observaciones:
+    nivel: Restringido-PII       # el original se enmascara y se descarta: no tiene columna fisica (ADR 0001)
+    tratamiento: enmascarar_texto_libre
+  cliente.observaciones_enmascarada:
+    nivel: Confidencial          # derivado (no es header): el detector puede fallar
+    fisicas: [raw.cliente.observaciones_enmascarada, core.dim_cliente.observaciones_enmascarada]
+
+  # ---- frontera (maestros/fronteras.csv) ------------------------------------------------------
+  frontera.frontera_id:
+    nivel: Interno
+    fisicas: [core.dim_frontera.frontera_id, core.fact_consumo_horario.frontera_id, core.fact_factura.frontera_id,
+              core.v_hueco.frontera_id, raw.lectura_consumo.frontera_id, analytics.v_consumo_mensual.frontera_id]
+  frontera.codigo_sic:
+    nivel: Interno
+    fisicas: [core.dim_frontera.codigo_sic]
+  frontera.cliente_id:
+    nivel: Interno
+  frontera.mercado:
+    nivel: Interno
+    fisicas: [core.dim_frontera.mercado]
+  frontera.operador_red:
+    nivel: Interno
+    fisicas: [core.dim_frontera.operador_red, analytics.v_consumo_mensual.operador_red]
+  frontera.nivel_tension:
+    nivel: Interno
+    fisicas: [core.dim_frontera.nivel_tension, analytics.v_consumo_mensual.nivel_tension]
+  frontera.fecha_registro:
+    nivel: Interno
+    fisicas: [core.dim_frontera.fecha_registro]
+  frontera.estado:
+    nivel: Interno
+    fisicas: [core.dim_frontera.estado]
+
+  # ---- limite (maestros/limites_frontera.csv) -------------------------------------------------
+  limite.frontera_id:
+    nivel: Interno
+  limite.min_kwh:
+    nivel: Interno
+    fisicas: [core.dim_frontera.min_kwh]
+  limite.max_kwh:
+    nivel: Interno
+    fisicas: [core.dim_frontera.max_kwh]
+
+  # ---- consumo (consumos/*.csv; variantes de header como alias) -------------------------------
+  consumo.frontera_id:
+    nivel: Interno
+  consumo.timestamp:
+    nivel: Interno
+    aliases: [timestamp_utc]
+    fisicas: [raw.lectura_consumo.ts_hora, core.fact_consumo_horario.ts_hora, core.v_hueco.ts_hora]
+  consumo.kwh:
+    nivel: Interno
+    aliases: [consumo_kwh]
+    fisicas: [raw.lectura_consumo.consumo_kwh, core.fact_consumo_horario.consumo_kwh,
+              analytics.v_consumo_mensual.consumo_kwh]
+  consumo.unidad:
+    nivel: Interno
+    fisicas: [raw.lectura_consumo.mwh_convertida]
+  consumo.version_lectura:
+    nivel: Interno
+    fisicas: [raw.lectura_consumo.version_lectura, core.fact_consumo_horario.version_lectura]
+  consumo.calidad_lectura:
+    nivel: Interno
+    fisicas: [raw.lectura_consumo.calidad]
+
+  # ---- factura (facturacion/*.json; las claves son rutas del JSON) ----------------------------
+  factura.periodo:
+    nivel: Interno
+    fisicas: [core.fact_factura.periodo]
+  factura.emisor.nombre:
+    nivel: Interno
+  factura.emisor.nit:
+    nivel: Interno               # NIT de Cauce, persona juridica emisora
+  factura.generado_en:
+    nivel: Interno
+    fisicas: [raw.factura.generado_en, core.fact_factura.generado_en]
+  factura.factura_id:
+    nivel: Interno
+    fisicas: [raw.factura.factura_id, core.fact_factura.factura_id, core.fact_factura_componente.factura_id]
+  factura.frontera_id:
+    nivel: Interno
+    fisicas: [raw.factura.frontera_id]
+  factura.cliente.nit:
+    nivel: Restringido-PII       # cifrado en raw (viaja en el payload), descartado en core
+    descartar: [core]
+  factura.cliente.razon_social:
+    nivel: Confidencial          # cifrada en raw por viajar dentro del subobjeto cliente; descartada en core
+    descartar: [core]
+  factura.cliente.email_facturacion:
+    nivel: Restringido-PII
+    descartar: [core]
+  factura.consumo_facturado_kwh:
+    nivel: Interno
+    fisicas: [core.fact_factura.consumo_facturado_kwh, analytics.v_consumo_mensual.consumo_facturado_kwh]
+  factura.tarifa_cop_kwh:
+    nivel: Confidencial
+    fisicas: [core.fact_factura.tarifa_cop_kwh]
+  factura.valor_total_cop:
+    nivel: Confidencial
+    fisicas: [core.fact_factura.valor_total_cop]
+  factura.componentes[].concepto:
+    nivel: Público
+    fisicas: [core.fact_factura_componente.concepto, core.dim_componente_tarifa.concepto]
+  factura.componentes[].valor_cop_kwh:
+    nivel: Confidencial
+    fisicas: [core.fact_factura_componente.valor_cop_kwh]
+  factura.metodo_pago.tipo:
+    nivel: Confidencial
+    fisicas: [core.fact_factura.metodo_pago_tipo]
+  factura.metodo_pago.cuenta_enmascarada:
+    nivel: Confidencial
+    descartar: [raw, core]       # minimizacion: se descarta incluso en raw
+  factura.payload_cifrado:
+    nivel: Restringido-PII       # derivado (no es header): cuerpo de la factura cifrado, para Cuarentena
+    fisicas: [raw.factura.payload_cifrado]
+  componente_tarifa.nombre:
+    nivel: Público               # derivado del estandar CREG, no viene en los datos
+    fisicas: [core.dim_componente_tarifa.nombre]
+
+  # ---- stream (mediciones.raw; sin tabla en PG: lo consume el detector de alertas) ------------
+  stream.evento_id:
+    nivel: Interno
+  stream.frontera_id:
+    nivel: Interno
+  stream.ts_medicion:
+    nivel: Interno
+  stream.kwh:
+    nivel: Interno
+  stream.medidor.serial:
+    nivel: Interno
+  stream.medidor.firmware:
+    nivel: Interno
+
+  # ---- quarantine -----------------------------------------------------------------------------
+  quarantine.fuente:
+    nivel: Interno
+    fisicas: [quarantine.rechazo.fuente]
+  quarantine.motivo:
+    nivel: Interno
+    fisicas: [quarantine.rechazo.motivo]
+  quarantine.payload:
+    nivel: Interno               # solo fuentes sin PII (consumo, frontera, limite)
+    fisicas: [quarantine.rechazo.payload]
+  quarantine.payload_cifrado:
+    nivel: Restringido-PII       # fuentes con PII (cliente, factura)
+    fisicas: [quarantine.rechazo.payload_cifrado]
+
+  # ---- bitacora (audit.bitacora_corrida) ------------------------------------------------------
+  bitacora.evento:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.evento]
+  bitacora.ts:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.ts]
+  bitacora.usuario_db:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.usuario_db]
+  bitacora.ejecutor:
+    nivel: Confidencial          # el usuario OS puede ser el nombre de una persona
+    fisicas: [audit.bitacora_corrida.ejecutor]
+  bitacora.comando:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.comando]
+  bitacora.version_codigo:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.version_codigo]
+  bitacora.fuente:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.fuente]
+  bitacora.filas_leidas:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.filas_leidas]
+  bitacora.filas_cargadas:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.filas_cargadas]
+  bitacora.filas_cuarentena:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.filas_cuarentena]
+  bitacora.filas_duplicadas:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.filas_duplicadas]
+  bitacora.resultado:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.resultado]
+  bitacora.codigo_error:
+    nivel: Interno
+    fisicas: [audit.bitacora_corrida.codigo_error]
+
+  # ---- out/dq_report.json y out/metrics.json (claves reales de observabilidad.Metricas) ---
+  dq_report.filas_leidas: {nivel: Interno}
+  dq_report.duplicados_exactos: {nivel: Interno}
+  dq_report.duplicados_conflictivos: {nivel: Interno}
+  dq_report.registros_negativos: {nivel: Interno}
+  dq_report.registros_nulos: {nivel: Interno}
+  dq_report.registros_outlier: {nivel: Interno}
+  dq_report.registros_mwh_convertidos: {nivel: Interno}
+  dq_report.correcciones_tardias_aplicadas: {nivel: Interno}
+  dq_report.horas_sin_lectura_valida_total: {nivel: Interno}
+  dq_report.horas_sin_lectura_valida_por_frontera: {nivel: Interno}
+  dq_report.fronteras_huerfanas_facturacion: {nivel: Interno}
+  dq_report.clientes_con_pii_en_texto_libre: {nivel: Interno}
+  metrics.corrida_id: {nivel: Interno}
+  metrics.ts_inicio: {nivel: Interno}
+  metrics.ts_fin: {nivel: Interno}
+  metrics.resultado: {nivel: Interno}
+  metrics.filas_leidas: {nivel: Interno}
+  metrics.filas_cargadas: {nivel: Interno}
+  metrics.filas_rechazadas_por_motivo: {nivel: Interno}
+  metrics.por_fuente: {nivel: Interno}
+  metrics.archivos: {nivel: Interno}
+  metrics.duracion_s_por_etapa: {nivel: Interno}
+  metrics.duracion_s_total: {nivel: Interno}
+  metrics.pii_filtrada_en_logs: {nivel: Interno}
+  metrics.stream: {nivel: Interno}
+
+  # ---- logs.* (claves de eventos de observabilidad.CATALOGO; su filtro por clave sale de aca) ---
+  logs.ts: {nivel: Interno}
+  logs.nivel: {nivel: Interno}
+  logs.evento: {nivel: Interno}
+  logs.corrida_id: {nivel: Interno}
+  logs.modo: {nivel: Interno}
+  logs.resultado: {nivel: Interno}
+  logs.duracion_s_total: {nivel: Interno}
+  logs.etapa: {nivel: Interno}
+  logs.duracion_s: {nivel: Interno}
+  logs.fuente: {nivel: Interno}
+  logs.archivo: {nivel: Interno}
+  logs.leidas: {nivel: Interno}
+  logs.cargadas: {nivel: Interno}
+  logs.rechazadas_por_motivo: {nivel: Interno}
+  logs.motivo: {nivel: Interno}
+  logs.cantidad: {nivel: Interno}
+  logs.eventos_leidos: {nivel: Interno}
+  logs.invalidos: {nivel: Interno}
+  logs.invalidos_por_motivo: {nivel: Interno}
+  logs.duplicados: {nivel: Interno}
+  logs.alertas_por_tipo: {nivel: Interno}
+  logs.nombre: {nivel: Interno}
+  logs.error_tipo: {nivel: Interno}
+  logs.sqlstate: {nivel: Interno}
+  logs.pila: {nivel: Interno}
+  logs.codigo_error: {nivel: Interno}
+  logs.evento_origen: {nivel: Interno}
+  logs.tipo: {nivel: Interno}
+  logs.logger: {nivel: Interno}
+  logs.clase: {nivel: Interno}
+  logs.causa: {nivel: Interno}
+  logs.nombres: {nivel: Interno}
+
+# Columnas tecnicas (linaje, llaves, cadena de hash, derivadas de la vista): sin campo logico de fuente.
+tecnicas:
+  Interno:
+    - raw.archivo.archivo_id
+    - raw.archivo.nombre
+    - raw.archivo.sha256
+    - raw.archivo.fuente
+    - raw.archivo.estado
+    - raw.archivo.corrida_id
+    - raw.archivo_conteo.archivo_id
+    - raw.archivo_conteo.contador
+    - raw.archivo_conteo.valor
+    - raw.lectura_consumo.archivo_id
+    - raw.lectura_consumo.linea
+    - raw.linea.archivo_id
+    - raw.linea.numero_linea
+    - raw.linea.linea
+    - raw.cliente.archivo_id
+    - raw.cliente.numero_linea
+    - raw.cliente.key_version
+    - raw.factura.archivo_id
+    - raw.factura.key_version
+    - raw.factura.numero_linea
+    - quarantine.rechazo.rechazo_id
+    - quarantine.rechazo.corrida_id
+    - quarantine.rechazo.archivo_id
+    - quarantine.rechazo.linea
+    - quarantine.rechazo.key_version
+    - crypto.dek.key_version
+    - crypto.dek.creada_en
+    - core.dim_cliente.key_version
+    - core.dim_cliente.corrida_id
+    - core.fact_consumo_horario.mes_local
+    - core.fact_consumo_horario.archivo_id
+    - core.fact_consumo_horario.corrida_id
+    - analytics.v_consumo_mensual.mes
+    - analytics.v_consumo_mensual.horas_con_dato
+    - analytics.v_consumo_mensual.horas_hueco
+    - analytics.v_consumo_mensual.diferencia_kwh
+    - analytics.v_consumo_mensual.diferencia_pct
+    - audit.bitacora_corrida.evento_id
+    - audit.bitacora_corrida.corrida_id
+    - audit.bitacora_corrida.archivo_id
+    - audit.bitacora_corrida.hash_previo
+    - audit.bitacora_corrida.hash
+    - audit.ddl_huella.huella
+    - audit.ddl_huella.aplicada_en
+  Confidencial:
+    - raw.factura.payload        # JSON con la tarifa y el subobjeto cliente ya cifrado
+    - crypto.dek.dek_envuelta

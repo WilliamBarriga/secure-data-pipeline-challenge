@@ -1,0 +1,226 @@
+// Modelo de datos en Postgres por zonas (un esquema por zona).
+// Convencion: <col>_cifrado = AES-256-GCM en la app (nonce|ct|tag), AAD = tabla|col|llave_natural.
+// corrida_id es uuid en todas las zonas y no lleva FK: la Bitacora tiene N eventos por Corrida (revision pre-build, D2).
+// raw y quarantine son append-only para ingesta (solo INSERT); UPDATE solo en core.
+// Sin FK entre dim_frontera y dim_cliente, ni de fact_consumo_horario a dim_frontera: los maestros se cargan por archivo
+// y en cualquier orden, y una Frontera o un Cliente ausente es dato, no error (sql/02_tablas.sql). Las unicas FK de core
+// son fact_factura -> dim_frontera / dim_cliente, fact_factura_componente y los linajes a raw.archivo y crypto.dek.
+// Destino de cada fuente = su Ficha de Fuente (fuentes.FICHAS: Destino(raw, core, clave, con_corrida)): frontera y limite
+// -> core.dim_frontera; cliente -> raw.cliente + core.dim_cliente; consumo -> raw.lectura_consumo -> merge B3 ->
+// core.fact_consumo_horario; factura -> raw.factura + core.fact_factura. Las columnas core salen de la fila custodiada.
+
+specification {
+  node esquema { description "Esquema de Postgres = zona" icon box color gray }
+  node tabla   { description "Tabla" icon database color blue }
+  node vista   { description "Vista (derivada, no materializada)" icon database color green }
+}
+
+model {
+  esquema raw "raw" "Filas fuente tal cual, con linaje; PII ya cifrada; append-only" {
+    tabla archivo "raw.archivo" {
+      archivo_id: bigint pk
+      nombre: text
+      sha256: text "unico junto con fuente y nombre: el mismo contenido bajo otro nombre es otro archivo"
+      fuente: text "consumo | cliente | frontera | limite | factura"
+      estado: text "fijado al insertar (cargado | rechazado); sin UPDATE"
+      corrida_id: uuid
+    }
+    tabla archivo_conteo "raw.archivo_conteo" {
+      archivo_id: bigint pk fk
+      contador: text pk "catalogo cerrado: leidas, nulos, negativos, outlier, mwh_convertidas, no_numerico, clientes_con_pii, fronteras_fuera_maestro, ..."
+      valor: int "calculado por fuentes.leer (clientes_con_pii: custodia; fronteras_fuera_maestro: almacen al cargar consumo, solo si > 0); fuente unica de dq_report, metrics y bitacora"
+    }
+    tabla lectura_consumo "raw.lectura_consumo" {
+      archivo_id: bigint pk fk
+      linea: int pk
+      frontera_id: text
+      ts_hora: timestamptz
+      consumo_kwh: numeric "Decimal en Python, normalizado a kWh"
+      version_lectura: int
+      calidad: text?
+      mwh_convertida: boolean
+    }
+    tabla linea "raw.linea" {
+      archivo_id: bigint pk fk
+      numero_linea: int pk
+      linea: text "texto crudo sin parsear (consumo, frontera, limite)"
+    }
+    tabla cliente "raw.cliente" {
+      archivo_id: bigint pk fk
+      numero_linea: int pk
+      cliente_id: text
+      razon_social: text
+      ciudad: text
+      departamento: text
+      nit_cifrado: bytea "PII"
+      email_contacto_cifrado: bytea "PII"
+      celular_contacto_cifrado: bytea "PII"
+      direccion_cifrado: bytea "PII"
+      representante_legal_cifrado: bytea "PII"
+      observaciones_enmascarada: text "enmascarada antes de escribir; original nunca persiste"
+      key_version: int fk
+    }
+    tabla factura "raw.factura" {
+      archivo_id: bigint pk fk
+      factura_id: text pk
+      numero_linea: int "posicion en facturas[]"
+      frontera_id: text
+      generado_en: timestamptz "del archivo; desempata el factura_id repetido"
+      payload: jsonb "subobjeto cliente reemplazado por su version cifrada; metodo_pago.cuenta_enmascarada descartada"
+      payload_cifrado: bytea "PII: cuerpo para Cuarentena (huerfana o perdedora)"
+      key_version: int fk
+    }
+  }
+
+  esquema quarantine "quarantine" "Todo lo rechazado, con motivo; nada se borra; append-only" {
+    tabla rechazo "quarantine.rechazo" {
+      rechazo_id: bigint pk "Facturas huerfanas y perdedoras se insertan ORDER BY archivo, linea"
+      corrida_id: uuid
+      fuente: text
+      archivo_id: bigint fk
+      linea: int? "nula si se rechaza el archivo entero"
+      motivo: text
+      payload: text? "solo fuentes sin PII (consumo, frontera, limite)"
+      payload_cifrado: bytea? "fuentes con PII (cliente, factura)"
+      key_version: int? fk
+    }
+  }
+
+  esquema crypto "crypto" "DEK envueltas; la KEK vive fuera de Postgres" {
+    tabla dek "crypto.dek" {
+      key_version: int pk
+      dek_envuelta: bytea
+      creada_en: timestamptz
+    }
+  }
+
+  esquema core "core" "Modelo estrella; llaves naturales; dims SCD1" {
+    tabla dim_cliente "core.dim_cliente" {
+      cliente_id: text pk
+      razon_social: text
+      ciudad: text
+      departamento: text
+      nit_cifrado: bytea "PII"
+      nit_bidx: bytea "HMAC-SHA256 del NIT normalizado, para joins"
+      email_contacto_cifrado: bytea "PII"
+      celular_contacto_cifrado: bytea "PII"
+      direccion_cifrado: bytea "PII"
+      representante_legal_cifrado: bytea "PII"
+      observaciones_enmascarada: text "original descartado"
+      key_version: int fk
+      corrida_id: uuid
+    }
+    tabla dim_frontera "core.dim_frontera" {
+      frontera_id: text pk
+      codigo_sic: text uk
+      cliente_id: text "sin FK: un Cliente ausente del maestro es dato, no error"
+      mercado: text
+      operador_red: text
+      nivel_tension: int
+      fecha_registro: date
+      estado: text
+      min_kwh: numeric "banda operativa"
+      max_kwh: numeric "banda operativa"
+    }
+    tabla fact_consumo_horario "core.fact_consumo_horario" {
+      frontera_id: text pk "sin FK a dim_frontera: una Frontera solo vista en consumos entra igual"
+      ts_hora: timestamptz pk
+      mes_local: date "generada: date_trunc('month', ts_hora AT TIME ZONE 'America/Bogota')::date; to_char no es IMMUTABLE"
+      consumo_kwh: numeric "normalizado a kWh"
+      version_lectura: int
+      archivo_id: bigint fk
+      corrida_id: uuid
+    }
+    tabla fact_factura "core.fact_factura" {
+      factura_id: text pk
+      frontera_id: text fk
+      cliente_id: text? fk "resuelto via frontera; NULL si la Frontera no tiene Cliente en dim_cliente"
+      periodo: date "primer dia del mes; compara directo con mes_local"
+      generado_en: timestamptz?
+      consumo_facturado_kwh: numeric?
+      tarifa_cop_kwh: numeric?
+      valor_total_cop: numeric?
+      metodo_pago_tipo: text?
+    }
+    tabla fact_factura_componente "core.fact_factura_componente" {
+      factura_id: text pk fk
+      concepto: text pk fk
+      valor_cop_kwh: numeric
+    }
+    tabla dim_componente_tarifa "core.dim_componente_tarifa" {
+      concepto: text pk "G T D C P R"
+      nombre: text
+    }
+    vista v_hueco "core.v_hueco" {
+      frontera_id: text "Fronteras del maestro (dim_frontera) o vistas en consumos"
+      ts_hora: timestamptz "hora local calendario del mes sin Lectura valida; nada se imputa"
+    }
+  }
+
+  esquema analytics "analytics" "Unico punto de acceso del analista; sin PII" {
+    vista v_consumo_mensual "analytics.v_consumo_mensual" {
+      frontera_id: text
+      cliente_id: text? "NULL si la Frontera no esta en el maestro (LEFT JOIN a dim_frontera)"
+      mes: text "to_char(mes_local, 'YYYY-MM') en la vista"
+      consumo_kwh: numeric? "medido: suma de lecturas ganadoras, sin imputar"
+      horas_con_dato: int
+      horas_hueco: int
+      consumo_facturado_kwh: numeric? "core.fact_factura por frontera_id + periodo = mes"
+      diferencia_kwh: numeric? "facturado - medido; NULL si falta un lado"
+      diferencia_pct: numeric? "diferencia / medido x 100, 2 dec; NULL si medido 0 o NULL"
+      operador_red: text?
+      nivel_tension: int?
+    }
+  }
+
+  esquema audit "audit" "Bitacora append-only (triggers sin UPDATE, DELETE ni TRUNCATE); solo via audit.registrar_evento (SECURITY DEFINER, advisory xact lock); el auditor la lee y llama audit.verificar_cadena" {
+    tabla ddl_huella "audit.ddl_huella" {
+      huella: text pk "sha256 de sql/*.sql; bootstrap salta el DDL si coincide"
+      aplicada_en: timestamptz
+    }
+    tabla bitacora_corrida "audit.bitacora_corrida" {
+      evento_id: bigint pk "identity; la cadena de hash sigue este orden"
+      corrida_id: uuid "N eventos por Corrida"
+      evento: text "corrida_inicio | etapa_fin | archivo_* | corrida_fin"
+      ts: timestamptz "clock_timestamp()"
+      usuario_db: text "session_user"
+      ejecutor: text "Confidencial"
+      comando: text "run | stream"
+      version_codigo: text
+      fuente: text? "nombre de fuente de datos | stream | stream.descartado.<motivo> | stream.alerta.<tipo>"
+      archivo_id: bigint?
+      filas_leidas: int?
+      filas_cargadas: int?
+      filas_cuarentena: int?
+      filas_duplicadas: int?
+      resultado: text? "ok | parcial | fallo"
+      codigo_error: text? "catalogo cerrado"
+      hash_previo: bytea? "lo fija el trigger bitacora_encadenar"
+      hash: bytea? "lo fija el trigger bitacora_encadenar; audit.verificar_cadena la recorre"
+    }
+  }
+
+  raw.linea#archivo_id "0..*" -> "1" raw.archivo#archivo_id "viene de" identifying
+  raw.cliente#archivo_id "0..*" -> "1" raw.archivo#archivo_id "viene de" identifying
+  raw.factura#archivo_id "0..*" -> "1" raw.archivo#archivo_id "viene de" identifying
+  raw.archivo_conteo#archivo_id "0..*" -> "1" raw.archivo#archivo_id "cuenta" identifying
+  raw.lectura_consumo#archivo_id "0..*" -> "1" raw.archivo#archivo_id "candidata de" identifying
+  raw.cliente#key_version "0..*" -> "1" crypto.dek#key_version "cifrado con"
+  raw.factura#key_version "0..*" -> "1" crypto.dek#key_version "cifrado con"
+
+  quarantine.rechazo#archivo_id "0..*" -> "1" raw.archivo#archivo_id "de"
+  quarantine.rechazo#key_version "0..*" -> "0..1" crypto.dek#key_version "cifrado con"
+
+  core.dim_cliente#key_version "0..*" -> "1" crypto.dek#key_version "cifrado con"
+  core.fact_consumo_horario#archivo_id "0..*" -> "1" raw.archivo#archivo_id "linaje"
+  core.fact_factura#frontera_id "0..*" -> "1" core.dim_frontera#frontera_id "factura"
+  core.fact_factura#cliente_id "0..*" -> "1" core.dim_cliente#cliente_id "a"
+  core.fact_factura_componente#factura_id "1..*" -> "1" core.fact_factura#factura_id "desglosa" identifying
+  core.fact_factura_componente#concepto "0..*" -> "1" core.dim_componente_tarifa#concepto "es" identifying
+}
+
+view modelo-datos {
+  type er
+  theme cauce
+  include raw, raw.**, quarantine, quarantine.**, crypto, crypto.**, core, core.**, analytics, analytics.**, audit, audit.**
+}

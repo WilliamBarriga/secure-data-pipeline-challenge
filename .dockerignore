@@ -1,0 +1,12 @@
+data
+config
+estado
+out
+logs
+.venv*
+.git
+.claude
+docs
+__pycache__
+*.pyc
+.env

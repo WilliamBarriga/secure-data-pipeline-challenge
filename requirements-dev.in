@@ -1,0 +1,7 @@
+# Herramientas de prueba y lint (ADR 0002). requirements-dev.txt las fija con hashes y se instala
+# junto a requirements.txt: la imagen las necesita porque `make test` corre en el contenedor.
+-c requirements.txt
+pytest
+ruff==0.17.4
+# `make auditar`: audita requirements*.txt contra la base de vulnerabilidades de PyPI
+pip-audit==2.10.1

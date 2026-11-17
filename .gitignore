@@ -1,0 +1,25 @@
+# Datos de entrada: inmutables, pueden contener PII; se generan con make datos
+data/
+# Secretos heredados del PoC y estado local: NO versionar
+config/pipeline.yaml
+.env
+estado/
+# Workspace temporal de diagramas (repo aparte, ver README)
+docs/diagrams/
+# Artefactos
+out/
+logs/
+.venv*/
+__pycache__/
+*.pyc
+node_modules/
+# Terraform (infra/): el lock si se versiona
+infra/.terraform/
+*.tfstate
+*.tfstate.*
+
+# Worktrees de agentes
+.claude/
+
+# Credenciales locales: las genera make credenciales / make up
+credenciales.yaml

@@ -1,0 +1,110 @@
+# ---------------------------------------------------------------------------
+# Infraestructura local. Endurecida respecto al PoC heredado (ver SECURITY.md):
+# imagenes por version + digest, puertos solo en 127.0.0.1, healthchecks,
+# sin MinIO (ADR 0002), sin credenciales en el archivo.
+#
+# Las variables PG_* salen de estado/.env (`make up` lo genera desde
+# credenciales.yaml y pasa --env-file). Nunca se escriben aca.
+# ---------------------------------------------------------------------------
+services:
+  postgres:
+    image: postgres:16.15-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
+    environment:
+      POSTGRES_USER: ${PG_SUPERUSER:-}
+      POSTGRES_PASSWORD: ${PG_SUPERPASSWORD:-}
+      POSTGRES_DB: ${PG_DATABASE:-cauce_datos}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - log_statement=none
+    ports:
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  redpanda:
+    image: redpandadata/redpanda:v26.1.20@sha256:8c94f3135dcb94736744aea8fae1ca46c46c7d26ad219cb2e2c10defbe884872
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --set
+      - redpanda.auto_create_topics_enabled=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:${KAFKA_PORT:-9092}
+    ports:
+      - "127.0.0.1:${KAFKA_PORT:-9092}:9092"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Proceso cauce. Solo corre con `--profile app` (make lo usa via $(CAUCE)).
+  # Contrato de runtime (igual que RUNTIME=local): data/ ro (o CAUCE_DATA del host); out/ logs/ estado/ rw;
+  # credenciales.yaml ro (make credenciales lo monta rw puntualmente); data/ rw solo en `datos`.
+  app: &app
+    profiles: [app]
+    build: .
+    image: cauce-app:local
+    working_dir: /app
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      HOME: /tmp
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      KAFKA_BOOTSTRAP: redpanda:29092
+    volumes:
+      - ${CAUCE_DATA:-./data}:/app/data:ro
+      - ./out:/app/out
+      - ./logs:/app/logs
+      - ./estado:/app/estado
+      - ./credenciales.yaml:/app/credenciales.yaml:ro
+      # tests montados: make test corre la suite del arbol, no la copiada en la imagen
+      - ./tests:/app/tests:ro
+      # tools/ montado: el generador de Datos sinteticos que corren los tests es el del arbol
+      - ./tools:/app/tools:ro
+
+  # Unico servicio con data/ rw (make datos): escribe Datos sinteticos; no ve estado/ ni credenciales.yaml.
+  datos:
+    <<: *app
+    volumes:
+      - ${CAUCE_DATA:-./data}:/app/data:rw
+      - ./tools:/app/tools:ro
+
+  # Unico servicio con credenciales.yaml rw (make credenciales).
+  credenciales:
+    <<: *app
+    volumes:
+      - ./estado:/app/estado
+      - ./credenciales.yaml:/app/credenciales.yaml:rw
+
+volumes:
+  pgdata:

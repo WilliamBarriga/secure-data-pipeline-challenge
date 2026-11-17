@@ -1,0 +1,11 @@
+# Lint del repo (`make lint`). Sin `ruff format`: el formato queda como esta (ver docs/anexos/ai-usage-registro.md).
+target-version = "py313"
+line-length = 120
+extend-exclude = ["docs/diagrams", "tools/producer.py"]  # docs/diagrams es un clone ajeno; el productor viene resuelto
+
+[lint]
+# pycodestyle, pyflakes, isort, bugbear, pyupgrade
+select = ["E", "W", "F", "I", "B", "UP"]
+
+[lint.isort]
+known-first-party = ["cauce", "apoyo"]

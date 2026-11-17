@@ -1,0 +1,142 @@
+// Infra (infra/*.tf): como correria el pipeline en AWS con los equivalentes de C3 (cifrado),
+// C4 (roles de menor privilegio) y C5 (Bitacora append-only). NO se despliega: el criterio es `make infra-validar`
+// (terraform fmt -check + init -backend=false + validate). Un modulo raiz plano, sin modulos hijos.
+// Solo se dibuja lo que el HCL define. Object Lock COMPLIANCE y CloudTrail con data events estan recortados a
+// `no_implementado` por el recorte de alcance (DECISIONS.md, 2026-11-10): son control propuesto (infra/README.md), no recursos;
+// van aparte, con el tipo `propuesto`, y sin Aristas de implementacion. RDS, MSK y ECS tampoco se declaran: la tarea
+// ECS que asume el rol `ingesta` aparece solo como el actor que lo asume.
+
+specification {
+  node tf_actor      { description "Quien asume un rol o administra (fuera del HCL)" icon user color purple }
+  node tf_grupo      { description "Agrupacion (archivo .tf o zona de AWS)" icon box color gray }
+  node tf_config     { description "Configuracion de Terraform (providers, versions, variables, outputs)" icon box color gray }
+  node tf_llave      { description "aws_kms_key con su alias y su key policy" icon box color amber }
+  node tf_bucket     { description "aws_s3_bucket con versionado, SSE-KMS, Block Public Access y BucketOwnerEnforced" icon database color blue }
+  node tf_politica   { description "Politica de recurso o de identidad (aws_iam_policy_document)" icon box color green }
+  node tf_rol        { description "aws_iam_role con su politica inline" icon user color blue }
+  node tf_propuesto  { description "Control propuesto: no_implementado, NO existe en el HCL" icon cloud color red }
+}
+
+model {
+  tf_grupo terraform "Modulo raiz de infra/" "Terraform ~> 1.17 con provider hashicorp/aws ~> 6.72 (lock con hashes de 5 plataformas); sin backend: el de S3 con use_lockfile esta comentado como opcion de produccion" {
+    tf_config versiones "versions.tf" "required_version ~> 1.17; aws ~> 6.72; backend S3 solo comentado"
+    tf_config providers "providers.tf" "provider aws con default_tags; data aws_caller_identity y aws_partition; locals cuenta, particion, raiz (arn :root) y via_s3"
+    tf_config variables "variables.tf" "region (us-east-1), prefijo (cauce; validado 2-21 caracteres), tags (proyecto, gestionado)"
+    tf_config outputs "outputs.tf" "buckets (nombres), llaves_kms (ARN) y roles (ARN)"
+  }
+
+  tf_grupo aws "Cuenta AWS" "Recursos que el HCL declara. Nada tiene s3:DeleteObject ni s3:DeleteObjectVersion para ningun rol" {
+    tf_grupo kms "kms.tf" "Tres llaves con 30 dias de ventana de borrado. La cuenta (:root) solo administra (statement AdministracionCuenta comun, sin kms:*); el uso se concede en cada key policy, rol por rol" {
+      tf_llave kms_s3 "kms_s3" "ENCRYPT_DECRYPT con rotacion; SSE-KMS de los buckets. ingesta: GenerateDataKey + Decrypt; analista y auditor: Decrypt; todo solo via s3.<region>.amazonaws.com y desde la cuenta (kms:ViaService, kms:CallerAccount)"
+      tf_llave kms_pii "kms_pii" "ENCRYPT_DECRYPT con rotacion; KEK del envelope de PII (en local, la KEK de estado/.env). Solo ingesta: GenerateDataKey + Decrypt"
+      tf_llave kms_bidx "kms_bidx" "HMAC_256, GENERATE_VERIFY_MAC, sin rotacion (las llaves HMAC no la admiten; riesgo aceptado: rotar = recalcular el blind index). Solo ingesta: GenerateMac"
+    }
+
+    tf_grupo s3 "s3.tf y auditoria.tf" "Endurecimiento comun a ambos buckets (for_each sobre local.buckets). Sin server access logging de S3 (su destino no admite SSE-KMS)" {
+      tf_bucket datos "Bucket datos" "<prefijo>-datos-<cuenta>. Prefijos entrada/ (espejo de data/, hostil) y salidas/ (espejo de out/); los prefijos son la frontera de IAM. Lifecycle: expira versiones no actuales a 90 dias y aborta multiparts a 7"
+      tf_bucket auditoria "Bucket auditoria" "<prefijo>-auditoria-<cuenta>. Espejo de la Bitacora fuera de Postgres: corridas/ (un objeto por Corrida). Sin lifecycle: no expira nada. No es WORM"
+      tf_politica politica_bucket "Politica de los buckets" "NegarSinTLS (aws:SecureTransport), NegarSinSSEKMS (PutObject sin header de llave KMS) y NegarOtraLlave (PutObject con llave distinta de kms_s3). Solo en auditoria: NegarBorrado de DeleteObject y DeleteObjectVersion; un admin con s3:PutBucketPolicy puede quitarlo, por eso no es WORM"
+    }
+
+    tf_grupo iam "iam.tf" "Equivalentes de los roles de Postgres (C4). El uso de llaves no se concede aqui sino en las key policies" {
+      tf_rol ingesta "Rol ingesta" "Pipeline. Confianza: ecs-tasks.amazonaws.com con aws:SourceAccount (confused deputy). Lee entrada/; lee y escribe salidas/ (el stream relee metrics.json); solo PutObject en auditoria/corridas/ (como el solo EXECUTE de registrar_evento); ListBucket limitado por s3:prefix"
+      tf_rol analista "Rol analista" "Confianza: la cuenta con aws:MultiFactorAuthPresent. Solo GetObject y ListBucket de salidas/ (equivalente de analytics.v_consumo_mensual); sin kms_pii ni kms_bidx"
+      tf_rol auditor "Rol auditor" "Confianza: la cuenta con MFA. Solo GetObject/GetObjectVersion y ListBucket/ListBucketVersions del bucket auditoria, y cloudtrail:LookupEvents (Resource * obligatorio; Event history de 90 dias); nada en datos"
+    }
+  }
+
+  tf_grupo propuesto "Propuesto, no implementado (recorte de alcance)" "Documentado en infra/README.md; no hay ni un recurso en el HCL. Hoy auditoria no es WORM" {
+    tf_propuesto object_lock "Object Lock COMPLIANCE en auditoria" "Propuesto: object_lock_enabled y aws_s3_bucket_object_lock_configuration con retencion por variable (retencion_auditoria_dias, 365). Nadie, ni root, acortaria la retencion. Estado: no_implementado"
+    tf_propuesto cloudtrail "CloudTrail con data events de datos" "Propuesto: aws_cloudtrail multi-region con validacion de integridad, cifrado con kms_s3 y envio a auditoria/cloudtrail/. Exige que la politica de auditoria acepte tambien AES256 y permitir PutObject a cloudtrail.amazonaws.com; que CloudTrail escriba en un bucket con Object Lock no esta confirmado por documentacion oficial. Estado: no_implementado"
+  }
+
+  tf_actor tarea_ecs "Tarea del pipeline (ECS, no declarada)" "Quien asume el rol ingesta; la tarea no esta en el HCL"
+  tf_actor persona_analista "Persona analista" "Asume el rol analista con MFA"
+  tf_actor persona_auditor "Persona auditora" "Asume el rol auditor con MFA"
+  tf_actor admin_cuenta "Administrador de la cuenta (:root)" "Administra las llaves; no las usa. Riesgo: kms:Put* le deja reescribir la key policy; en produccion se cubre con una alarma sobre PutKeyPolicy"
+
+  // Configuracion
+  terraform.providers -> terraform.versiones "usa el provider fijado"
+  terraform.variables -> terraform.providers "region, tags"
+  terraform.providers -> aws.kms "cuenta y arn :root en las key policies"
+  terraform.providers -> aws.s3 "cuenta en el nombre del bucket"
+  terraform.providers -> aws.iam "cuenta en la confianza de los roles"
+  aws.s3.datos -> terraform.outputs "nombre"
+  aws.s3.auditoria -> terraform.outputs "nombre"
+  aws.kms.kms_s3 -> terraform.outputs "ARN"
+  aws.kms.kms_pii -> terraform.outputs "ARN"
+  aws.kms.kms_bidx -> terraform.outputs "ARN"
+  aws.iam.ingesta -> terraform.outputs "ARN"
+  aws.iam.analista -> terraform.outputs "ARN"
+  aws.iam.auditor -> terraform.outputs "ARN"
+
+  // Cifrado
+  aws.s3.datos -> aws.kms.kms_s3 "SSE-KMS con bucket key"
+  aws.s3.auditoria -> aws.kms.kms_s3 "SSE-KMS con bucket key"
+  aws.s3.politica_bucket -> aws.s3.datos "TLS, SSE-KMS y solo kms_s3"
+  aws.s3.politica_bucket -> aws.s3.auditoria "TLS, SSE-KMS, solo kms_s3 y sin borrado"
+
+  // Roles
+  tarea_ecs -> aws.iam.ingesta "AssumeRole (SourceAccount)"
+  persona_analista -> aws.iam.analista "AssumeRole con MFA"
+  persona_auditor -> aws.iam.auditor "AssumeRole con MFA"
+  admin_cuenta -> aws.kms "administra, no usa"
+
+  aws.iam.ingesta -> aws.s3.datos "GetObject entrada/; Get y Put salidas/"
+  aws.iam.ingesta -> aws.s3.auditoria "PutObject corridas/"
+  aws.iam.ingesta -> aws.kms.kms_s3 "GenerateDataKey, Decrypt via S3"
+  aws.iam.ingesta -> aws.kms.kms_pii "GenerateDataKey, Decrypt"
+  aws.iam.ingesta -> aws.kms.kms_bidx "GenerateMac"
+  aws.iam.analista -> aws.s3.datos "GetObject salidas/"
+  aws.iam.analista -> aws.kms.kms_s3 "Decrypt via S3"
+  aws.iam.auditor -> aws.s3.auditoria "GetObject, GetObjectVersion, listados"
+  aws.iam.auditor -> aws.kms.kms_s3 "Decrypt via S3"
+
+  // Propuesto (sin existir): solo para ubicarlo, no es una dependencia implementada
+  propuesto.object_lock -> aws.s3.auditoria "propuesto: WORM (no_implementado)"
+  propuesto.cloudtrail -> aws.s3.datos "propuesto: data events (no_implementado)"
+  propuesto.cloudtrail -> aws.s3.auditoria "propuesto: envio a cloudtrail/ (no_implementado)"
+}
+
+view infra-terraform {
+  type architecture
+  theme cauce
+  include terraform.**, aws.**, propuesto.**, tarea_ecs, persona_analista, persona_auditor, admin_cuenta
+}
+
+view infra-cifrado {
+  type flow
+  theme cauce
+  include aws.kms.**, aws.s3.**, aws.iam.ingesta, tarea_ecs, admin_cuenta
+  steps {
+    step "Tres llaves: la cuenta solo administra, nunca usa (sin kms:*)" {
+      show admin_cuenta, aws.kms.kms_s3, aws.kms.kms_pii, aws.kms.kms_bidx
+    }
+    step "Los buckets cifran con kms_s3 y la politica exige TLS, SSE-KMS y esa sola llave" {
+      show aws.s3.datos, aws.s3.auditoria, aws.s3.politica_bucket, aws.kms.kms_s3
+    }
+    step "ingesta es la unica que usa kms_pii (envelope) y kms_bidx (blind index)" {
+      show tarea_ecs, aws.iam.ingesta, aws.kms.kms_pii, aws.kms.kms_bidx
+    }
+  }
+}
+
+view infra-roles {
+  type flow
+  theme cauce
+  include aws.iam.**, aws.s3.datos, aws.s3.auditoria, tarea_ecs, persona_analista, persona_auditor, propuesto.**
+  steps {
+    step "ingesta: lee entrada/, escribe salidas/ y solo PutObject en auditoria/corridas/" {
+      show tarea_ecs, aws.iam.ingesta, aws.s3.datos, aws.s3.auditoria
+    }
+    step "analista: solo salidas/ de datos, con MFA" {
+      show persona_analista, aws.iam.analista, aws.s3.datos
+    }
+    step "auditor: solo el bucket auditoria y el Event history, con MFA" {
+      show persona_auditor, aws.iam.auditor, aws.s3.auditoria
+    }
+    step "Propuesto y no implementado (recorte de alcance): Object Lock y CloudTrail" {
+      show propuesto.object_lock, propuesto.cloudtrail, aws.s3.auditoria, aws.s3.datos
+    }
+  }
+}
